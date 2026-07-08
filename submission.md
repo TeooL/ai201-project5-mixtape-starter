@@ -1,5 +1,41 @@
 # Mixtape Bug Hunt — Submission
 
+## Codebase Map
+
+**`app.py`** — Flask application factory. Configures the SQLAlchemy DB URI, initializes the `db` extension, registers the four blueprints (`songs`, `playlists`, `users`, `feed`) under their URL prefixes, and creates tables on startup. This is the only file that wires routes together.
+
+**`models.py`** — All SQLAlchemy models and association tables:
+- `User` — has `listening_streak` and `last_listened_at` columns used by the streak feature, plus relationships to songs, ratings, listening events, notifications, playlists, and friends (via the `friendships` self-referential many-to-many table).
+- `Song` — a shared song; has `shared_by` (the sharer), and relationships to `ratings`, `listening_events`, and `tags` (many-to-many via `song_tags`).
+- `Tag` — a labeled genre/style tag, many-to-many with `Song` via `song_tags`.
+- `ListeningEvent` — one row per "user listened to a song" action; timestamped, drives both the streak feature and the friends feed.
+- `Rating` — a user's 1–5 score for a song, one row per `(user_id, song_id)` pair (enforced by a unique constraint). This is a separate model, not a column on `Song`.
+- `Playlist` — a named collection of songs; `songs` relationship goes through `playlist_entries`, a many-to-many table that (unlike a plain association table) carries its own `position`, `added_by`, and `added_at` columns — so playlist order is explicit data, not insertion order.
+- `Notification` — a per-user message with a `notification_type` (e.g. `"song_added_to_playlist"`, `"song_rated"`) and a `read` flag.
+
+**`routes/`** — one Flask blueprint per resource area: `songs.py` (search, get, rate, listen), `playlists.py` (create, get, list songs, add song), `users.py` (profile, streak, notifications), `feed.py` (listening-now, activity). Each route handler parses the request (query args or JSON body), does light presence validation (e.g. "is `user_id` present"), calls exactly one service function, and converts the result (or a caught `ValueError`) into a `jsonify` response with the appropriate status code.
+
+**`services/`** — all business logic, one file per feature area: `streak_service.py` (listening streak math), `feed_service.py` ("listening now" / activity feed queries), `search_service.py` (song search), `notification_service.py` (creating/reading notifications, plus the rating and playlist-add flows that trigger them), `playlist_service.py` (playlist CRUD and ordered song retrieval). Services are the only code that touches `db.session` for anything beyond simple lookups.
+
+**`seed_data.py`** — populates the DB with users, friendships, songs (with varying tag counts), listening events at deliberately chosen ages, playlists, and notifications, specifically shaped to expose the five tracked bugs (e.g., listening events at both ~15 minutes and 2+ hours old, to distinguish "recent" from "stale" in the feed).
+
+**`tests/`** — one file per feature with dedicated bug coverage: `test_streaks.py`, `test_search.py`, `test_playlists.py`. Notably, there's no test file for `feed_service.py` or `notification_service.py` — those two issues (#2 and #4) had to be verified manually rather than via an existing failing test.
+
+### Data flow — a user rates a song
+
+1. `POST /songs/<song_id>/rate` in `routes/songs.py` reads `user_id` and `score` from the JSON body, checks both are present, and calls `notification_service.rate_song(user_id, song_id, score)`.
+2. `rate_song` (in `services/notification_service.py`) validates the score is 1–5, looks up the `Song` and rating `User`, then checks for an existing `Rating` row for that `(user_id, song_id)` pair — if found it updates the score in place, otherwise it creates a new `Rating` row. Either way it commits.
+3. After the rating is saved, `rate_song` compares `song.shared_by` to the rater's `user_id`; if they differ (a friend rated it, not the sharer themselves), it calls `create_notification(user_id=song.shared_by, notification_type="song_rated", body=...)`, which inserts a `Notification` row for the original sharer.
+4. The route returns the serialized `Rating` (`rating.to_dict()`) with a 201 status. The sharer later sees the notification via `GET /users/<user_id>/notifications` → `notification_service.get_notifications()`.
+
+This mirrors the sibling flow `add_to_playlist` uses for `"song_added_to_playlist"` notifications — both follow "do the domain write, commit, then notify the sharer if someone else acted" — which is exactly the pattern (and the gap) at the center of [Issue #4](#issue-4-i-got-notified-when-a-friend-added-my-song-to-a-playlist-but-not-when-they-rated-it) below.
+
+### Pattern I noticed
+
+Every route handler is a thin adapter: parse request → call one service function → `jsonify` the result or catch `ValueError` and map it to a 4xx response. No route touches `db.session` or a model directly. All domain logic — validation beyond "is this field present," streak math, feed filtering, notification triggering, ordering — lives in `services/`, and each service file owns one feature area. The one crosscutting exception is `notification_service.py`, which contains both the notification CRUD (`create_notification`, `get_notifications`, `mark_as_read`) *and* the two feature flows that trigger notifications as a side effect (`add_to_playlist`, `rate_song`) — so it's importing from `playlist_service` rather than the other way around, which is worth knowing before assuming "playlist logic lives in `playlist_service.py`."
+
+---
+
 ## Issue #1: My listening streak keeps resetting
 
 **How I reproduced it**
